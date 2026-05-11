@@ -1,0 +1,41 @@
+{
+	"name": "workspace",
+	// Select the architecture-specific workspace image tag before Docker Compose runs.
+	"initializeCommand": ".devcontainer/scripts/select-workspace-image.sh",
+	// Use the Compose service that defines networking, privileges, and runtime mounts.
+	"dockerComposeFile": "docker-compose.yml",
+	"service": "workspace",
+	// Let dev containers manage the workspace process lifecycle instead of using the image's default command directly.
+	"overrideCommand": true,
+	// Match the home directory and working area used by the workspace image.
+	"workspaceFolder": "/home/ubuntu",
+	// Start runtime services that cannot be launched safely at image build time.
+	"postStartCommand": "/usr/local/bin/startup-script.sh",
+	// Surface the browser-accessible desktop.
+	"forwardPorts": [6080],
+	"portsAttributes": {
+		"6080": {
+			"label": "Duckietown virtual desktop",
+			"onAutoForward": "notify"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			// Install the core tools used for Duckietown-related work.
+			"extensions": [
+				"charliermarsh.ruff",
+				"docker.docker",
+				"github.vscode-pull-request-github",
+				"ms-azuretools.vscode-containers",
+				"ms-python.debugpy",
+				"ms-python.mypy-type-checker",
+				"ms-python.python",
+				"ms-toolsai.jupyter",
+				"ms-toolsai.jupyter-keymap",
+				"ms-toolsai.jupyter-renderers",
+				"njpwerner.autodocstring",
+				"redhat.vscode-yaml"
+			]
+		}
+	}
+}

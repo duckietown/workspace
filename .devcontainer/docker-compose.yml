@@ -1,0 +1,16 @@
+services:
+  workspace:
+    # The image tag is selected for the host architecture by select-workspace-image.sh.
+    image: duckietown/workspace:${WORKSPACE_IMAGE_TAG}
+    # Use the host network so that Duckietown services are reachable without port forwarding.
+    network_mode: host
+    # Required by the dev container features that start Docker and networking services inside the workspace.
+    privileged: true
+    # Reap background processes started by the dev container startup script instead of leaving zombies.
+    init: true
+    volumes:
+      # Share the host mkcert CA with the workspace so that the Duckietown Shell uses certificates trusted by the host browser.
+      - ${MKCERT_PATH:-${HOME}/Library/Application Support/mkcert}:/caroot:ro,cached
+    environment:
+      # The Duckietown Shell reads CAROOT when generating local HTTPS certificates.
+      - CAROOT=/caroot
