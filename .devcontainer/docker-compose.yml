@@ -9,8 +9,15 @@ services:
     # Reap background processes started by the dev container startup script instead of leaving zombies.
     init: true
     volumes:
+      # Persist the workspace user's home directory across container rebuilds.
+      - workspace-home:/home/ubuntu
+      # Give /tmp a fresh anonymous volume for each container.
+      - /tmp
       # Share the host mkcert CA with the workspace so that the Duckietown Shell uses certificates trusted by the host browser.
       - ${MKCERT_PATH:-${HOME}/Library/Application Support/mkcert}:/caroot:ro,cached
     environment:
       # The Duckietown Shell reads CAROOT when generating local HTTPS certificates.
       - CAROOT=/caroot
+
+volumes:
+  workspace-home:

@@ -71,9 +71,3 @@ WORKDIR /home/ubuntu
 # Install the Duckietown Shell as the ubuntu user
 RUN pipx install duckietown-shell && \
     pipx ensurepath
-
-# Create volume for home directory
-VOLUME /home/ubuntu
-
-# Create volume for /tmp
-VOLUME /tmp
