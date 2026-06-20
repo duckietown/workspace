@@ -1,1 +1,5 @@
 /.devcontainer/.env
+/.devcontainer/.host_runner.log
+/.devcontainer/.host_runner.pid
+/.devcontainer/.host_runner.token
+/.devcontainer/scripts/__pycache__/

@@ -13,11 +13,20 @@ services:
       - workspace-home:/home/ubuntu
       # Give /tmp a fresh anonymous volume for each container.
       - /tmp
+      # Share the host-runner request queue with the host checkout so delegated
+      # GUI launches can be handed off without relying on host networking.
+      - /tmp/duckietown/host_runner_requests:/tmp/duckietown/host_runner_requests
       # Share the host mkcert CA with the workspace so that the Duckietown Shell uses certificates trusted by the host browser.
       - ${MKCERT_PATH:-${HOME}/Library/Application Support/mkcert}:/caroot:ro,cached
     environment:
       # The Duckietown Shell reads CAROOT when generating local HTTPS certificates.
       - CAROOT=/caroot
+      # The host runner is started automatically by select-workspace-image.sh and is required for native host GUI delegation.
+      - DTS_HOST_RUNNER_URL=${DTS_HOST_RUNNER_URL:?select-workspace-image.sh must set DTS_HOST_RUNNER_URL}
+      - DTS_HOST_RUNNER_TOKEN=${DTS_HOST_RUNNER_TOKEN:?select-workspace-image.sh must set DTS_HOST_RUNNER_TOKEN}
+      - DTS_HOST_RUNNER_REQUESTS_DIR=/tmp/duckietown/host_runner_requests
+      - DTS_HOST_RUNNER_ENGINE_HOST=${DTS_HOST_RUNNER_ENGINE_HOST:-127.0.0.1}
+      - DTS_HOST_RUNNER_TIMEOUT=${DTS_HOST_RUNNER_TIMEOUT:-86400}
 
 volumes:
   workspace-home:
