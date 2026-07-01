@@ -10,6 +10,8 @@ COPY scripts/install-features.sh /tmp/install-features.sh
 # Copy the other scripts to /usr/local/bin
 COPY scripts/startup-script.sh /usr/local/bin/startup-script.sh
 
+COPY scripts/host_runner_bootstrap.py /usr/local/bin/host_runner_bootstrap.py
+
 COPY scripts/configure_avahi.sh /usr/local/bin/configure_avahi.sh
 
 COPY scripts/configure_avahi.awk /usr/local/bin/configure_avahi.awk
