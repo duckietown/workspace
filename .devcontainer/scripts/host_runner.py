@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -18,15 +19,18 @@ from collections.abc import Iterable
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Protocol, TextIO, cast
+from typing import IO, Any, BinaryIO, Protocol, TextIO
 
 pty_module: Any = None
+termios_module: Any = None
 try:
     import pty as _pty_module
+    import termios as _termios_module
 except ImportError:
     pass
 else:
     pty_module = _pty_module
+    termios_module = _termios_module
 
 
 SCRIPT_FILE = __file__
@@ -43,6 +47,8 @@ REQUEST_FILE_SUFFIX = ".request.json"
 PROCESSING_FILE_SUFFIX = ".processing.json"
 STREAM_FILE_SUFFIX = ".stream"
 STREAM_CHUNK_FILE_SUFFIX = ".chunk"
+STDIN_FILE_SUFFIX = ".stdin"
+STDIN_EOF_SUFFIX = ".stdin.eof"
 CANCEL_FILE_SUFFIX = ".cancel"
 HEARTBEAT_FILE_SUFFIX = ".heartbeat"
 DEFAULT_REQUESTS_DIR = str(DEFAULT_REQUESTS_DIR_PATH)
@@ -67,6 +73,7 @@ REQUEST_ENV_EXPECTATION = "a JSON object"
 HOST_RUNNER_DTS_EXECUTABLE = "dts"
 ALLOWED_DELEGATED_DTS_COMMANDS = (
     ("matrix", "run"),
+    ("init_sd_card",),
     ("duckiebot", "image_viewer"),
     ("duckiebot", "keyboard_control"),
     ("duckiebot", "calibrate_intrinsics"),
@@ -75,11 +82,14 @@ ALLOWED_DELEGATED_DTS_COMMANDS = (
     ("duckiebot", "graph_plotter"),
 )
 ALLOWED_DTS_CLI_OPTIONS = {"--debug", "--verbose", "-vv", "--quiet", "-q"}
+STREAM_READ_MAX_BYTES = 4096
 PROCESS_WAIT_TIMEOUT_SECONDS = 5
+PROCESS_INTERRUPT_INPUT_GRACE_SECONDS = 1
 REQUEST_WATCHER_HEARTBEAT_TIMEOUT_SECONDS = 3
 REQUEST_WATCHER_SUPERVISOR_INTERVAL_SECONDS = 1
 REQUEST_CONTROL_POLL_INTERVAL_SECONDS = 0.5
 REQUEST_HEARTBEAT_STALE_SECONDS = 6
+MIN_INHERITED_FILE_DESCRIPTOR_LIMIT = 4
 HOST_LABEL_MAX_LENGTH = 63
 MAX_PORT_NUMBER = 65535
 MAX_RENDERER_ID = 2147483647
@@ -88,12 +98,30 @@ PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+COUNTRY_CODE_PATTERN = re.compile(r"^[A-Za-z]{2}$")
+INIT_SD_CARD_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+INIT_SD_CARD_DEVICE_PATTERN = re.compile(r"^/dev/[A-Za-z0-9._-]+$")
+SINGLE_LINE_TEXT_PATTERN = re.compile(r"^[^\x00\r\n]+$")
 VIEWER_BOOLEAN_ARGS = {
     "--enable-hardware-acceleration",
     "--fullscreen",
     "--no-pull",
     "--on-top",
     "--verbose",
+}
+INIT_SD_CARD_BOOLEAN_ARGS = {
+    "--experimental",
+    "--help",
+    "--no-cache",
+    "--verify",
+    "-h",
+}
+INIT_SD_CARD_ALLOWED_STEPS = {
+    "download",
+    "flash",
+    "license",
+    "setup",
+    "verify",
 }
 MATRIX_BOOLEAN_ARG_MAP = {
     "--force-opengl": "--force-opengl",
@@ -122,11 +150,117 @@ def should_use_pty() -> bool:
     return pty_module is not None
 
 
+def configure_pty_slave_noecho(slave_fd: int) -> None:
+    if termios_module is None:
+        return
+    attributes = termios_module.tcgetattr(slave_fd)
+    local_modes = attributes[3]
+    local_modes &= ~termios_module.ECHO
+    local_modes &= ~termios_module.ECHONL
+    attributes[3] = local_modes
+    termios_module.tcsetattr(slave_fd, termios_module.TCSANOW, attributes)
+
+
+def configure_pty_stdio_noecho() -> None:
+    stdin_fd = 0
+    configure_pty_slave_noecho(stdin_fd)
+
+
+def inherited_file_descriptor_limit() -> int:
+    default_limit = 256
+    try:
+        file_descriptor_limit = os.sysconf("SC_OPEN_MAX")
+    except (AttributeError, OSError, ValueError):
+        return default_limit
+    if (
+        not isinstance(file_descriptor_limit, int)
+        or file_descriptor_limit < MIN_INHERITED_FILE_DESCRIPTOR_LIMIT
+    ):
+        return default_limit
+    return file_descriptor_limit
+
+
+def close_inherited_file_descriptors() -> None:
+    file_descriptor_limit = inherited_file_descriptor_limit()
+    os.closerange(3, file_descriptor_limit)
+
+
+def exec_pty_child(
+    command: list[str],
+    cwd: str,
+    env: dict[str, str],
+) -> None:
+    try:
+        close_inherited_file_descriptors()
+        configure_pty_stdio_noecho()
+        os.chdir(cwd)
+        os.execvpe(command[0], command, env)  # noqa: S606
+    except (OSError, ValueError) as error:
+        sys.stderr.write(f"Failed to launch host-side process: {error}\n")
+        sys.stderr.flush()
+    os._exit(127)
+
+
 class ByteWriter(Protocol):
 
     def write(self, data: bytes) -> object: ...
 
     def flush(self) -> object: ...
+
+
+class ManagedProcess(Protocol):
+
+    pid: int
+
+    def poll(self) -> int | None: ...
+
+    def wait(self) -> int: ...
+
+    def send_signal(self, signal_number: int) -> None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+class ForkedPtyProcess:
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self._return_code: int | None = None
+
+    def poll(self) -> int | None:
+        if self._return_code is not None:
+            return self._return_code
+        pid, status = os.waitpid(self.pid, os.WNOHANG)
+        if pid == 0:
+            return None
+        self._return_code = wait_status_to_return_code(status)
+        return self._return_code
+
+    def wait(self) -> int:
+        if self._return_code is not None:
+            return self._return_code
+        _, status = os.waitpid(self.pid, 0)
+        self._return_code = wait_status_to_return_code(status)
+        return self._return_code
+
+    def send_signal(self, signal_number: int) -> None:
+        os.kill(self.pid, signal_number)
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.send_signal(signal.SIGKILL)
+
+
+def wait_status_to_return_code(status: int) -> int:
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return status
 
 
 class ContainerPathError(ValueError):
@@ -388,12 +522,14 @@ def start_streamed_process(
     command: list[str],
     cwd: str,
     env: dict[str, str],
-) -> tuple["subprocess.Popen[Any]", TextIO]:
+) -> tuple[ManagedProcess, IO[str], IO[str] | None]:
     if not should_use_pty():
         pipe_process = subprocess.Popen(  # noqa: S603
             command,
             cwd=cwd,
             env=env,
+            start_new_session=True,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -403,27 +539,14 @@ def start_streamed_process(
         if output_stream is None:
             msg = "Host-side process stdout pipe was not created."
             raise RuntimeError(msg)
-        process_any = cast("subprocess.Popen[Any]", pipe_process)
-        output_text_stream = cast("TextIO", output_stream)
-        return process_any, output_text_stream
+        input_stream = pipe_process.stdin
+        return pipe_process, output_stream, input_stream
 
-    master_fd, slave_fd = pty_module.openpty()
-    try:
-        pty_process = subprocess.Popen(  # noqa: S603
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            close_fds=True,
-        )
-    except Exception:
-        os.close(master_fd)
-        os.close(slave_fd)
-        raise
+    child_pid, master_fd = pty_module.fork()
+    if child_pid == 0:
+        exec_pty_child(command, cwd, env)
 
-    os.close(slave_fd)
+    input_fd = os.dup(master_fd)
     output_stream = os.fdopen(
         master_fd,
         mode="r",
@@ -431,28 +554,180 @@ def start_streamed_process(
         errors="replace",
         buffering=1,
     )
-    process_any = cast("subprocess.Popen[Any]", pty_process)
-    return process_any, output_stream
+    input_stream = os.fdopen(
+        input_fd,
+        mode="w",
+        encoding="utf-8",
+        errors="replace",
+        buffering=1,
+    )
+    process = ForkedPtyProcess(child_pid)
+    return process, output_stream, input_stream
 
 
-def read_stream_segment(stream: TextIO) -> str:
-    buffered: list[str] = []
-    while True:
+def read_stream_segment(stream: IO[str]) -> str:  # noqa: C901, PLR0912
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None:
+        try:
+            raw_chunk = binary_stream.read1(STREAM_READ_MAX_BYTES)
+        except OSError as error:
+            eio = getattr(errno, "EIO", None)
+            if eio is not None and error.errno == eio:
+                raw_chunk = b""
+            else:
+                raise
+        if raw_chunk == b"":
+            return ""
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        return raw_chunk.decode(encoding, errors="replace")
+
+    try:
+        chunk = stream.read(1)
+    except OSError as error:
+        eio = getattr(errno, "EIO", None)
+        if eio is not None and error.errno == eio:
+            chunk = ""
+        else:
+            raise
+    if chunk == "":
+        return ""
+
+    buffered = [chunk]
+    stream_fd = stream.fileno()
+    while len(buffered) < STREAM_READ_MAX_BYTES:
+        try:
+            readable, _, _ = select.select([stream_fd], [], [], 0)
+        except (OSError, ValueError):
+            break
+        if not readable:
+            break
         try:
             chunk = stream.read(1)
         except OSError as error:
             eio = getattr(errno, "EIO", None)
             if eio is not None and error.errno == eio:
-                chunk = ""
-            else:
-                raise
-
+                break
+            raise
         if chunk == "":
-            return "".join(buffered)
-
+            break
         buffered.append(chunk)
-        if chunk in ("\n", "\r"):
-            return "".join(buffered)
+    return "".join(buffered)
+
+
+def stream_has_data_ready(
+    stream: IO[str],
+    *,
+    timeout: float,
+) -> bool:
+    try:
+        stream_fd = stream.fileno()
+    except (OSError, ValueError):
+        return False
+
+    try:
+        readable, _, _ = select.select([stream_fd], [], [], timeout)
+    except (OSError, ValueError):
+        return False
+    return bool(readable)
+
+
+def validate_single_line_text(value: str, *, option_name: str) -> str:
+    if SINGLE_LINE_TEXT_PATTERN.fullmatch(value) is None:
+        raise invalid_option_value_error(option_name, "a single-line value")
+    return value
+
+
+def validate_init_sd_card_step_list(value: str, *, option_name: str) -> str:
+    validated_steps: list[str] = []
+    for raw_step in value.split(","):
+        step = raw_step.strip()
+        if not step:
+            raise invalid_option_value_error(
+                option_name,
+                "a comma-separated list of valid init_sd_card steps",
+            )
+        if step not in INIT_SD_CARD_ALLOWED_STEPS:
+            allowed_steps = ", ".join(sorted(INIT_SD_CARD_ALLOWED_STEPS))
+            raise invalid_option_value_error(
+                option_name,
+                f"a comma-separated list containing only {allowed_steps}",
+            )
+        validated_steps.append(step)
+    return ",".join(validated_steps)
+
+
+def init_sd_card_stdin_chunk_path(
+    requests_dir: Path,
+    request_id: str,
+    index: int,
+) -> Path:
+    chunk_name = (
+        f"{request_id}{STDIN_FILE_SUFFIX}.{index:08d}{STREAM_CHUNK_FILE_SUFFIX}"
+    )
+    return requests_dir / chunk_name
+
+
+def cleanup_request_input_artifacts(
+    requests_dir: Path,
+    request_id: str,
+) -> None:
+    eof_path = request_path_for_suffix(
+        requests_dir,
+        request_id,
+        STDIN_EOF_SUFFIX,
+    )
+    with suppress(FileNotFoundError):
+        eof_path.unlink()
+    chunk_pattern = (
+        f"{request_id}{STDIN_FILE_SUFFIX}.*{STREAM_CHUNK_FILE_SUFFIX}"
+    )
+    for chunk_path in requests_dir.glob(chunk_pattern):
+        with suppress(FileNotFoundError):
+            chunk_path.unlink()
+
+
+def forward_request_input(
+    process: ManagedProcess,
+    input_stream: IO[str],
+    requests_dir: Path,
+    request_id: str,
+) -> None:
+    next_chunk_index = 0
+    eof_path = request_path_for_suffix(
+        requests_dir,
+        request_id,
+        STDIN_EOF_SUFFIX,
+    )
+    try:
+        while process.poll() is None:
+            chunk_path = init_sd_card_stdin_chunk_path(
+                requests_dir,
+                request_id,
+                next_chunk_index,
+            )
+            if chunk_path.exists():
+                ensure_request_artifact_is_not_symlink(chunk_path)
+                chunk_text = read_request_payload_text(chunk_path)
+                with suppress(FileNotFoundError):
+                    chunk_path.unlink()
+                if chunk_text:
+                    input_stream.write(chunk_text)
+                    input_stream.flush()
+                next_chunk_index += 1
+                continue
+
+            if eof_path.exists():
+                ensure_request_artifact_is_not_symlink(eof_path)
+                with suppress(FileNotFoundError):
+                    eof_path.unlink()
+                break
+
+            time.sleep(REQUEST_CONTROL_POLL_INTERVAL_SECONDS)
+    except (BrokenPipeError, OSError, ValueError):
+        return
+    finally:
+        with suppress(BrokenPipeError, OSError, ValueError):
+            input_stream.close()
 
 
 def resolve_dts_executable() -> str:
@@ -806,6 +1081,210 @@ def sanitize_viewer_argv(
     return sanitized
 
 
+def sanitize_init_sd_card_argv(  # noqa: C901, PLR0912, PLR0915
+    command: tuple[str, ...],
+    argv: list[str],
+) -> list[str]:
+    sanitized: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+
+        value, consumed = read_option_value(argv, index, long_option="--steps")
+        if consumed:
+            value = require_option_value(value, option_name="--steps")
+            steps = validate_init_sd_card_step_list(
+                value,
+                option_name="--steps",
+            )
+            sanitized.extend(["--steps", steps])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--no-steps",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--no-steps")
+            steps = validate_init_sd_card_step_list(
+                value,
+                option_name="--no-steps",
+            )
+            sanitized.extend(["--no-steps", steps])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--hostname",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--hostname")
+            hostname = validate_single_line_text(
+                value,
+                option_name="--hostname",
+            )
+            sanitized.extend(["--hostname", hostname])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--device",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--device")
+            device = validate_pattern_value(
+                value,
+                INIT_SD_CARD_DEVICE_PATTERN,
+                option_name="--device",
+                description="a /dev/... device path",
+            )
+            sanitized.extend(["--device", device])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--country",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--country")
+            country = validate_pattern_value(
+                value,
+                COUNTRY_CODE_PATTERN,
+                option_name="--country",
+                description="a 2-letter country code",
+            )
+            sanitized.extend(["--country", country])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--wifi",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--wifi")
+            wifi = validate_single_line_text(value, option_name="--wifi")
+            sanitized.extend(["--wifi", wifi])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--type",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--type")
+            robot_type = validate_pattern_value(
+                value,
+                INIT_SD_CARD_IDENTIFIER_PATTERN,
+                option_name="--type",
+                description="a robot type identifier",
+            )
+            sanitized.extend(["--type", robot_type])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--configuration",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--configuration")
+            configuration = validate_pattern_value(
+                value,
+                INIT_SD_CARD_IDENTIFIER_PATTERN,
+                option_name="--configuration",
+                description="a robot configuration identifier",
+            )
+            sanitized.extend(["--configuration", configuration])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            short_option="-S",
+            long_option="--size",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--size")
+            size = validate_integer_option(
+                value,
+                option_name="--size",
+                minimum=1,
+                maximum=1024,
+            )
+            sanitized.extend(["--size", size])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--version",
+        )
+        if consumed:
+            value = require_option_value(value, option_name="--version")
+            version = validate_pattern_value(
+                value,
+                VERSION_PATTERN,
+                option_name="--version",
+                description="an alphanumeric version identifier",
+            )
+            sanitized.extend(["--version", version])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--placeholders-version",
+        )
+        if consumed:
+            value = require_option_value(
+                value,
+                option_name="--placeholders-version",
+            )
+            version = validate_pattern_value(
+                value,
+                VERSION_PATTERN,
+                option_name="--placeholders-version",
+                description="an alphanumeric version identifier",
+            )
+            sanitized.extend(["--placeholders-version", version])
+            index += consumed
+            continue
+
+        if arg in INIT_SD_CARD_BOOLEAN_ARGS:
+            sanitized.append(arg)
+            index += 1
+            continue
+
+        if arg in {"--gui", "--image", "--workdir"}:
+            detail = f"{arg} is not supported in delegated init_sd_card runs"
+            raise invalid_delegated_arguments_error(command, detail)
+
+        if arg.startswith("-"):
+            detail = f"unsupported option {arg!r}"
+            raise invalid_delegated_arguments_error(command, detail)
+
+        detail = f"unexpected positional argument {arg!r}"
+        raise invalid_delegated_arguments_error(command, detail)
+
+    return sanitized
+
+
 def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
     command: tuple[str, ...],
     argv: list[str],
@@ -1081,6 +1560,8 @@ def sanitize_delegated_command_argv(
             container_root=container_root,
             host_root=host_root,
         )
+    if command_key == ("init_sd_card",):
+        return sanitize_init_sd_card_argv(command, argv)
     return sanitize_viewer_argv(command, argv)
 
 
@@ -1245,12 +1726,47 @@ def request_heartbeat_is_stale(
     return heartbeat_age > stale_after_seconds
 
 
-def request_process_shutdown(process: subprocess.Popen[Any]) -> None:
+def signal_process_group(
+    process: ManagedProcess,
+    signal_number: int,
+) -> bool:
+    try:
+        process_group = os.getpgid(process.pid)
+    except OSError:
+        return False
+
+    if process_group <= 0:
+        return False
+
+    try:
+        os.killpg(process_group, signal_number)
+    except OSError:
+        return False
+
+    return True
+
+
+def request_process_shutdown(  # noqa: C901
+    process: ManagedProcess,
+    input_stream: IO[str] | None = None,
+) -> None:
     if process.poll() is not None:
         return
 
-    with suppress(OSError, ValueError):
-        process.send_signal(signal.SIGINT)
+    if input_stream is not None:
+        with suppress(BrokenPipeError, OSError, ValueError):
+            input_stream.write("\x03")
+            input_stream.flush()
+
+        deadline = time.monotonic() + PROCESS_INTERRUPT_INPUT_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return
+            time.sleep(0.1)
+
+    if not signal_process_group(process, signal.SIGINT):
+        with suppress(OSError, ValueError):
+            process.send_signal(signal.SIGINT)
 
     deadline = time.monotonic() + PROCESS_WAIT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -1258,7 +1774,10 @@ def request_process_shutdown(process: subprocess.Popen[Any]) -> None:
             return
         time.sleep(0.1)
 
-    if process.poll() is None:
+    if process.poll() is None and not signal_process_group(
+        process,
+        signal.SIGTERM,
+    ):
         process.terminate()
 
     deadline = time.monotonic() + PROCESS_WAIT_TIMEOUT_SECONDS
@@ -1268,18 +1787,20 @@ def request_process_shutdown(process: subprocess.Popen[Any]) -> None:
         time.sleep(0.1)
 
     if process.poll() is None:
-        process.kill()
+        if not signal_process_group(process, signal.SIGKILL):
+            process.kill()
         process.wait()
 
 
 def watch_for_cancellation(
-    process: subprocess.Popen[Any],
+    process: ManagedProcess,
     cancel_path: Path,
     heartbeat_path: Path,
+    input_stream: IO[str] | None,
 ) -> None:
     while process.poll() is None:
         if cancel_request_is_signaled(cancel_path):
-            request_process_shutdown(process)
+            request_process_shutdown(process, input_stream)
             return
         if request_heartbeat_is_stale(heartbeat_path):
             stale_message = (
@@ -1287,7 +1808,7 @@ def watch_for_cancellation(
                 f"{heartbeat_path.name}; stopping child."
             )
             write_line(sys.stderr, stale_message)
-            request_process_shutdown(process)
+            request_process_shutdown(process, input_stream)
             return
         time.sleep(REQUEST_CONTROL_POLL_INTERVAL_SECONDS)
 
@@ -1333,6 +1854,8 @@ def process_request_file(
             host_cwd,
             child_env,
             writer,
+            requests_dir=requests_dir,
+            request_id=request_id,
             cancel_path=cancel_path,
             heartbeat_path=heartbeat_path,
             emit_launch_context=emit_launch_context,
@@ -1348,6 +1871,7 @@ def process_request_file(
         processing_path.unlink(missing_ok=True)
         cancel_path.unlink(missing_ok=True)
         heartbeat_path.unlink(missing_ok=True)
+        cleanup_request_input_artifacts(requests_dir, request_id)
 
 
 def start_request_processor(
@@ -1433,12 +1957,14 @@ def serve_request_directory(
         time.sleep(0.1)
 
 
-def stream_process_output(  # noqa: C901, PLR0913
+def stream_process_output(  # noqa: C901, PLR0912, PLR0913, PLR0915
     command: Iterable[str],
     cwd: str,
     env: dict[str, str],
     wfile: ByteWriter,
     *,
+    requests_dir: Path | None = None,
+    request_id: str | None = None,
     cancel_path: Path | None = None,
     heartbeat_path: Path | None = None,
     emit_launch_context: bool = False,
@@ -1472,7 +1998,11 @@ def stream_process_output(  # noqa: C901, PLR0913
         return
 
     try:
-        process, stdout_stream = start_streamed_process(command_list, cwd, env)
+        process, stdout_stream, stdin_stream = start_streamed_process(
+            command_list,
+            cwd,
+            env,
+        )
     except OSError as error:
         launch_error_message = f"Failed to launch host-side process: {error}\n"
         write_encoded(wfile, launch_error_message)
@@ -1485,16 +2015,39 @@ def stream_process_output(  # noqa: C901, PLR0913
     if cancel_path is not None:
         cancellation_thread = threading.Thread(
             target=watch_for_cancellation,
-            args=(process, cancel_path, heartbeat_path),
+            args=(process, cancel_path, heartbeat_path, stdin_stream),
             daemon=True,
             name=f"host-runner-cancel-{process.pid}",
         )
         cancellation_thread.start()
 
+    input_thread: threading.Thread | None = None
+    if (
+        requests_dir is not None
+        and request_id is not None
+        and stdin_stream is not None
+    ):
+        input_thread = threading.Thread(
+            target=forward_request_input,
+            args=(process, stdin_stream, requests_dir, request_id),
+            daemon=True,
+            name=f"host-runner-stdin-{process.pid}",
+        )
+        input_thread.start()
+
     try:
         while True:
+            if not stream_has_data_ready(
+                stdout_stream,
+                timeout=REQUEST_CONTROL_POLL_INTERVAL_SECONDS,
+            ):
+                if process.poll() is not None:
+                    break
+                continue
             segment = read_stream_segment(stdout_stream)
             if not segment:
+                if process.poll() is not None:
+                    break
                 break
             write_encoded(wfile, segment)
             wfile.flush()
@@ -1505,6 +2058,11 @@ def stream_process_output(  # noqa: C901, PLR0913
         stdout_stream.close()
         if cancellation_thread is not None:
             cancellation_thread.join(timeout=0.2)
+        if input_thread is not None:
+            input_thread.join(timeout=0.2)
+        if stdin_stream is not None:
+            with suppress(BrokenPipeError, OSError, ValueError):
+                stdin_stream.close()
 
     return_code = process.wait()
     exit_code_message = f"{HOST_RUNNER_EXIT_CODE_PREFIX}{return_code}\n"
