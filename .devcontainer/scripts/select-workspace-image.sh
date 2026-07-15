@@ -23,7 +23,7 @@ host_runner_request_dir="$host_runner_runtime_dir/host_runner_requests"
 host_runner_shared_env_file="$host_runner_request_dir/host_runner_endpoint.env"
 host_runner_default_port=59321
 host_runner_port="$host_runner_default_port"
-host_runner_container_root="/home/ubuntu/duckietown"
+host_runner_container_root="/home/ubuntu"
 host_runner_engine_host="127.0.0.1"
 
 select_workspace_image_tag() {
@@ -344,17 +344,23 @@ generate_host_runner_token() {
 }
 
 compute_host_runner_version() {
+  host_root=$1
+  container_root=$2
+
   run_host_python -c '
 import hashlib
 import pathlib
 import sys
 
 digest = hashlib.sha256()
-for arg in sys.argv[1:]:
+for arg in sys.argv[1:3]:
     path = pathlib.Path(arg)
     digest.update(path.read_bytes())
+for value in sys.argv[3:]:
+    digest.update(b"\0")
+    digest.update(value.encode("utf-8"))
 print(digest.hexdigest())
-  ' "$host_runner_script" "$host_runner_bootstrap_script"
+  ' "$host_runner_script" "$host_runner_bootstrap_script" "$host_root" "$container_root"
 }
 
 read_recorded_host_runner_version() {
@@ -393,7 +399,8 @@ stop_managed_host_runner() {
 
 start_host_runner() {
   token=$1
-  current_host_runner_version=$(compute_host_runner_version)
+  host_runner_root=$(detect_host_runner_root)
+  current_host_runner_version=$(compute_host_runner_version "$host_runner_root" "$host_runner_container_root")
   recorded_host_runner_version=$(read_recorded_host_runner_version)
   expected_host_runner_url=$(default_host_runner_url)
 
@@ -416,7 +423,6 @@ start_host_runner() {
 
   host_runner_port=$(choose_host_runner_port "$host_runner_port")
 
-  host_runner_root=$(detect_host_runner_root)
   mkdir -p "$host_runner_request_dir"
 
   if command -v python3 >/dev/null 2>&1; then

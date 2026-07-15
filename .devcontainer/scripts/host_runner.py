@@ -339,7 +339,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--container-root",
-        default="/home/ubuntu/duckietown",
+        default="/home/ubuntu",
         help=(
             "Absolute path to the same workspace root inside the dev "
             "container."
