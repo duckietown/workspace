@@ -74,6 +74,8 @@ HOST_RUNNER_DTS_EXECUTABLE = "dts"
 ALLOWED_DELEGATED_DTS_COMMANDS = (
     ("matrix", "run"),
     ("init_sd_card",),
+    ("sd_card", "init"),
+    ("sd_card", "update"),
     ("duckiebot", "image_viewer"),
     ("duckiebot", "keyboard_control"),
     ("duckiebot", "calibrate_intrinsics"),
@@ -114,6 +116,12 @@ INIT_SD_CARD_BOOLEAN_ARGS = {
     "--help",
     "--no-cache",
     "--verify",
+    "-h",
+}
+SD_CARD_UPDATE_BOOLEAN_ARGS = {
+    "--experimental",
+    "--help",
+    "--repair",
     "-h",
 }
 INIT_SD_CARD_ALLOWED_STEPS = {
@@ -1084,37 +1092,44 @@ def sanitize_viewer_argv(
 def sanitize_init_sd_card_argv(  # noqa: C901, PLR0912, PLR0915
     command: tuple[str, ...],
     argv: list[str],
+    *,
+    boolean_args: set[str] | None = None,
+    allow_steps: bool = True,
+    command_name: str = "init_sd_card",
 ) -> list[str]:
+    if boolean_args is None:
+        boolean_args = INIT_SD_CARD_BOOLEAN_ARGS
     sanitized: list[str] = []
     index = 0
     while index < len(argv):
         arg = argv[index]
 
-        value, consumed = read_option_value(argv, index, long_option="--steps")
-        if consumed:
-            value = require_option_value(value, option_name="--steps")
-            steps = validate_init_sd_card_step_list(
-                value,
-                option_name="--steps",
-            )
-            sanitized.extend(["--steps", steps])
-            index += consumed
-            continue
+        if allow_steps:
+            value, consumed = read_option_value(argv, index, long_option="--steps")
+            if consumed:
+                value = require_option_value(value, option_name="--steps")
+                steps = validate_init_sd_card_step_list(
+                    value,
+                    option_name="--steps",
+                )
+                sanitized.extend(["--steps", steps])
+                index += consumed
+                continue
 
-        value, consumed = read_option_value(
-            argv,
-            index,
-            long_option="--no-steps",
-        )
-        if consumed:
-            value = require_option_value(value, option_name="--no-steps")
-            steps = validate_init_sd_card_step_list(
-                value,
-                option_name="--no-steps",
+            value, consumed = read_option_value(
+                argv,
+                index,
+                long_option="--no-steps",
             )
-            sanitized.extend(["--no-steps", steps])
-            index += consumed
-            continue
+            if consumed:
+                value = require_option_value(value, option_name="--no-steps")
+                steps = validate_init_sd_card_step_list(
+                    value,
+                    option_name="--no-steps",
+                )
+                sanitized.extend(["--no-steps", steps])
+                index += consumed
+                continue
 
         value, consumed = read_option_value(
             argv,
@@ -1266,13 +1281,13 @@ def sanitize_init_sd_card_argv(  # noqa: C901, PLR0912, PLR0915
             index += consumed
             continue
 
-        if arg in INIT_SD_CARD_BOOLEAN_ARGS:
+        if arg in boolean_args:
             sanitized.append(arg)
             index += 1
             continue
 
         if arg in {"--gui", "--image", "--workdir"}:
-            detail = f"{arg} is not supported in delegated init_sd_card runs"
+            detail = f"{arg} is not supported in delegated {command_name} runs"
             raise invalid_delegated_arguments_error(command, detail)
 
         if arg.startswith("-"):
@@ -1562,6 +1577,20 @@ def sanitize_delegated_command_argv(
         )
     if command_key == ("init_sd_card",):
         return sanitize_init_sd_card_argv(command, argv)
+    if command_key == ("sd_card", "init"):
+        return sanitize_init_sd_card_argv(
+            command,
+            argv,
+            command_name="sd_card init",
+        )
+    if command_key == ("sd_card", "update"):
+        return sanitize_init_sd_card_argv(
+            command,
+            argv,
+            boolean_args=SD_CARD_UPDATE_BOOLEAN_ARGS,
+            allow_steps=False,
+            command_name="sd_card update",
+        )
     return sanitize_viewer_argv(command, argv)
 
 
