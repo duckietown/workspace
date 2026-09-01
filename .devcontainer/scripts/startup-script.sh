@@ -12,6 +12,14 @@ MDNS_REPUBLISHER_SUPERVISOR="$SCRIPT_DIR/mdns-republisher-supervisor.sh"
 MDNS_REPUBLISHER_LOG="/tmp/mdns-republisher.log"
 MDNS_REPUBLISHER_WATCHDOG_LOG="/tmp/mdns-republisher-watchdog.log"
 MDNS_REPUBLISHER_SUPERVISOR_LOG="/tmp/mdns-republisher-supervisor.log"
+DESKTOP_WATCHDOG_LOG="/tmp/desktop-watchdog.log"
+DESKTOP_WATCHDOG_PID_FILE="/tmp/desktop-watchdog.pid"
+DESKTOP_WATCHDOG_INTERVAL_SECONDS="${DESKTOP_WATCHDOG_INTERVAL_SECONDS:-5}"
+VNC_PORT=5999
+NOVNC_PORT=6080
+VNC_LOG="/tmp/xtigervnc.log"
+NOVNC_LOG="/tmp/novnc.log"
+NOVNC_PID_FILE="/tmp/novnc.pid"
 HOST_RUNNER_ENV_FILE="$SCRIPT_DIR/../.env"
 HOST_RUNNER_SHELL_ENV_FILE="$HOME/.host_runner_env.sh"
 HOST_RUNNER_BOOTSTRAP_SCRIPT="$SCRIPT_DIR/host_runner_bootstrap.py"
@@ -194,6 +202,132 @@ port_listening() {
     '
 }
 
+wait_for_port() {
+    local port="$1"
+    local max_attempts="${2:-30}"
+    local attempt=1
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if port_listening "$port"; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+
+    return 1
+}
+
+clean_stale_desktop_state() {
+    if ! port_listening "$VNC_PORT"; then
+        sudo rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock 2>/dev/null || true
+    fi
+
+    if ! port_listening "$NOVNC_PORT"; then
+        rm -f "$NOVNC_PID_FILE"
+    fi
+}
+
+start_vnc_desktop() {
+    echo "Starting VNC desktop..."
+    setsid tigervncserver :99 -SecurityTypes None -localhost >"$VNC_LOG" 2>&1 </dev/null &
+}
+
+start_novnc_desktop() {
+    if [ ! -d "/usr/local/novnc/websockify-0.10.0" ]; then
+        NOVNC_STATUS="noVNC installation not found"
+        return 1
+    fi
+
+    echo "Starting noVNC desktop..."
+    (
+        cd /usr/local/novnc/websockify-0.10.0
+        exec setsid python3 -m websockify --web /usr/local/novnc/noVNC-1.3.0 "$NOVNC_PORT" "localhost:${VNC_PORT}"
+    ) >"$NOVNC_LOG" 2>&1 </dev/null &
+    echo $! >"$NOVNC_PID_FILE"
+}
+
+ensure_desktop_services() {
+    if [ ! -f "/usr/local/share/desktop-init.sh" ]; then
+        VNC_STATUS="desktop-lite startup script not found"
+        NOVNC_STATUS="desktop-lite startup script not found"
+        return 0
+    fi
+
+    clean_stale_desktop_state
+
+    if ! port_listening "$VNC_PORT"; then
+        start_vnc_desktop
+        if wait_for_port "$VNC_PORT"; then
+            echo "VNC started on port ${VNC_PORT}"
+            VNC_STATUS="running on port ${VNC_PORT}"
+        else
+            echo "ERROR: VNC failed to start. Check ${VNC_LOG}"
+            VNC_STATUS="not detected; see ${VNC_LOG}"
+        fi
+    else
+        VNC_STATUS="already running on port ${VNC_PORT}"
+    fi
+
+    if port_listening "$VNC_PORT"; then
+        if ! port_listening "$NOVNC_PORT"; then
+            if start_novnc_desktop && wait_for_port "$NOVNC_PORT"; then
+                echo "noVNC started on port ${NOVNC_PORT}"
+                NOVNC_STATUS="running at http://localhost:${NOVNC_PORT}"
+            elif [ "$NOVNC_STATUS" != "noVNC installation not found" ]; then
+                echo "WARNING: noVNC may not have started. Check ${NOVNC_LOG}"
+                NOVNC_STATUS="not detected; see ${NOVNC_LOG}"
+            fi
+        else
+            NOVNC_STATUS="already running at http://localhost:${NOVNC_PORT}"
+        fi
+    else
+        NOVNC_STATUS="not started because VNC is unavailable"
+    fi
+
+    return 0
+}
+
+desktop_watchdog_is_running() {
+    local watchdog_pid watchdog_command
+
+    if [ ! -f "$DESKTOP_WATCHDOG_PID_FILE" ]; then
+        return 1
+    fi
+
+    watchdog_pid="$(tr -d '[:space:]' <"$DESKTOP_WATCHDOG_PID_FILE")"
+    if [ -z "$watchdog_pid" ] || ! kill -0 "$watchdog_pid" 2>/dev/null; then
+        rm -f "$DESKTOP_WATCHDOG_PID_FILE"
+        return 1
+    fi
+
+    watchdog_command="$(ps -ww -p "$watchdog_pid" -o command= 2>/dev/null || true)"
+    if printf '%s\n' "$watchdog_command" | grep -F -- "$SCRIPT_DIR/startup-script.sh --desktop-watchdog" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    rm -f "$DESKTOP_WATCHDOG_PID_FILE"
+    return 1
+}
+
+start_desktop_watchdog() {
+    if desktop_watchdog_is_running; then
+        return 0
+    fi
+
+    nohup bash "$SCRIPT_DIR/startup-script.sh" --desktop-watchdog >"$DESKTOP_WATCHDOG_LOG" 2>&1 </dev/null &
+    echo $! >"$DESKTOP_WATCHDOG_PID_FILE"
+}
+
+run_desktop_watchdog() {
+    trap 'rm -f "$DESKTOP_WATCHDOG_PID_FILE"' EXIT
+
+    while true; do
+        ensure_desktop_services
+        sleep "$DESKTOP_WATCHDOG_INTERVAL_SECONDS"
+    done
+}
+
 describe_caroot() {
     if [ -z "${CAROOT:-}" ]; then
         echo "not configured"
@@ -271,6 +405,11 @@ repair_git_lfs_config() {
         git lfs install --force >/dev/null
     fi
 }
+
+if [ "${1:-}" = "--desktop-watchdog" ]; then
+    run_desktop_watchdog
+    exit 0
+fi
 
 # Configure DNS resolver options
 # The short timeout and single-request-reopen setting reduce resolver stalls in
@@ -384,86 +523,9 @@ else
     fi
 fi
 
-# Call desktop-lite startup script
-if [ -f "/usr/local/share/desktop-init.sh" ] && [ ! -f "/tmp/desktop-init.lock" ]; then
-    echo "Starting desktop via desktop-lite feature..."
-    # Use a lock file because this startup script can be invoked repeatedly.
-    touch /tmp/desktop-init.lock
-    
-    # Clean any stale sockets
-    sudo rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock 2>/dev/null
-    mkdir -p $HOME/.vnc
-    
-    # Initialize Firefox profile directory
-    mkdir -p $HOME/.mozilla/firefox
-    
-    # Start X server with VNC using tigervncserver (includes window manager)
-    setsid tigervncserver :99 -SecurityTypes None -localhost >/tmp/xtigervnc.log 2>&1 </dev/null &
-    disown
-    
-    echo "Waiting for VNC to start..."
-    # Wait for VNC to start (up to 30 seconds)
-    for i in $(seq 1 30); do
-        if port_listening 5999; then
-            break
-        fi
-        sleep 1
-    done
-    if port_listening 5999; then
-        echo "VNC started on port 5999"
-        VNC_STATUS="running on port 5999"
-    else
-        echo "ERROR: VNC failed to start. Check /tmp/xtigervnc.log"
-        VNC_STATUS="not detected; see /tmp/xtigervnc.log"
-    fi
-    
-    # Start noVNC if VNC is running
-    if port_listening 5999; then
-        if [ -d "/usr/local/novnc" ]; then
-            # Start websockify from its directory so the module can be found
-            cd /usr/local/novnc/websockify-0.10.0
-            setsid python3 -m websockify --web /usr/local/novnc/noVNC-1.3.0 6080 localhost:5999 >/tmp/novnc.log 2>&1 </dev/null &
-            echo $! > /tmp/novnc.pid
-            disown
-            cd - >/dev/null
-            
-            # Wait for noVNC to start (up to 30 seconds)
-            for i in $(seq 1 30); do
-                if port_listening 6080; then
-                    break
-                fi
-                sleep 1
-            done
-            
-            if port_listening 6080; then
-                echo "noVNC started on port 6080"
-                NOVNC_STATUS="running at http://localhost:6080"
-            else
-                echo "WARNING: noVNC may not have started. Check /tmp/novnc.log"
-                NOVNC_STATUS="not detected; see /tmp/novnc.log"
-            fi
-        else
-            NOVNC_STATUS="noVNC installation not found"
-        fi
-    else
-        NOVNC_STATUS="not started because VNC is unavailable"
-    fi
-else
-    if [ ! -f "/usr/local/share/desktop-init.sh" ]; then
-        VNC_STATUS="desktop-lite startup script not found"
-        NOVNC_STATUS="desktop-lite startup script not found"
-    else
-        if port_listening 5999; then
-            VNC_STATUS="already running on port 5999"
-        else
-            VNC_STATUS="desktop lock present; port 5999 not detected"
-        fi
-        if port_listening 6080; then
-            NOVNC_STATUS="already running at http://localhost:6080"
-        else
-            NOVNC_STATUS="desktop lock present; port 6080 not detected"
-        fi
-    fi
-fi
+# Reconcile desktop services at startup, then keep them healthy in the background.
+mkdir -p "$HOME/.vnc" "$HOME/.mozilla/firefox"
+ensure_desktop_services
+start_desktop_watchdog
 
 print_workspace_health_summary

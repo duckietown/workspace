@@ -17,10 +17,22 @@
 		"6080": {
 			"label": "Duckietown virtual desktop",
 			"onAutoForward": "notify"
+		},
+		".+": {
+			"onAutoForward": "notify"
 		}
+	},
+	"otherPortsAttributes": {
+		"onAutoForward": "ignore"
 	},
 	"customizations": {
 		"vscode": {
+			"settings": {
+				"remote.autoForwardPorts": true,
+				"remote.autoForwardPortsSource": "process",
+				"remote.autoForwardPortsFallback": 0,
+				"remote.restoreForwardedPorts": false
+			},
 			// Install the core tools used for Duckietown-related work.
 			"extensions": [
 				"charliermarsh.ruff",
