@@ -1,7 +1,7 @@
 {
 	"name": "workspace",
 	// Select the architecture-specific workspace image tag before Docker Compose runs.
-	"initializeCommand": ".devcontainer/scripts/select-workspace-image.sh",
+	"initializeCommand": "rm -f /tmp/duckietown/.host_runner.version && .devcontainer/scripts/select-workspace-image.sh",
 	// Use the Compose service that defines networking, privileges, and runtime mounts.
 	"dockerComposeFile": "docker-compose.yml",
 	"service": "workspace",

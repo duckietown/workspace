@@ -121,6 +121,7 @@ INIT_SD_CARD_BOOLEAN_ARGS = {
 SD_CARD_UPDATE_BOOLEAN_ARGS = {
     "--experimental",
     "--help",
+    "--password",
     "--repair",
     "-h",
 }
