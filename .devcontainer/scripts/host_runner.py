@@ -136,6 +136,7 @@ MATRIX_BOOLEAN_ARG_MAP = {
     "--force-opengl": "--force-opengl",
     "--force-vulkan": "--force-vulkan",
     "--no-tutorial": "--no-tutorial",
+    "--on-top": "--on-top",
     "--profiler": "--profiler",
     "--verbose": "--verbose",
     "-gl": "--force-opengl",
