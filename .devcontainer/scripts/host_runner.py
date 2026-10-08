@@ -95,6 +95,7 @@ MIN_INHERITED_FILE_DESCRIPTOR_LIMIT = 4
 HOST_LABEL_MAX_LENGTH = 63
 MAX_PORT_NUMBER = 65535
 MAX_RENDERER_ID = 2147483647
+MAX_TARGET_FRAME_RATE = 2147483647
 HOST_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -1329,6 +1330,26 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
                 description="an alphanumeric version identifier",
             )
             sanitized.extend(["--version", version])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--target-frame-rate",
+        )
+        if consumed:
+            value = require_option_value(
+                value,
+                option_name="--target-frame-rate",
+            )
+            target_frame_rate = validate_integer_option(
+                value,
+                option_name="--target-frame-rate",
+                minimum=-1,
+                maximum=MAX_TARGET_FRAME_RATE,
+            )
+            sanitized.extend(["--target-frame-rate", target_frame_rate])
             index += consumed
             continue
 
