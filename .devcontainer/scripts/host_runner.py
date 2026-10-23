@@ -57,6 +57,7 @@ FORWARDED_ENVIRONMENT_MAP = {
     "HOST_DTSHELL_COMMANDS": "DTSHELL_COMMANDS",
     "HOST_DTS_HOST_RUNNER_ENGINE_HOST": "DTS_HOST_RUNNER_ENGINE_HOST",
     "HOST_DTS_HOST_RUNNER_FRONTEND_URL": "DTS_HOST_RUNNER_FRONTEND_URL",
+    "HOST_DTS_VIEWER_HANDOFF": "DTS_VIEWER_HANDOFF",
     "HOST_DTS_HOST_RUNNER_MATRIX_RENDERER_ONLY": (
         "DTS_HOST_RUNNER_MATRIX_RENDERER_ONLY"
     ),
@@ -807,6 +808,29 @@ def map_container_path(path: str, container_root: str, host_root: str) -> str:
         resolved_host_root_path,
     )
     return str(resolved_mapped_path)
+
+
+def map_viewer_handoff(value: object, requests_dir: str) -> str:
+    field = "env.HOST_DTS_VIEWER_HANDOFF"
+    expected = "a regular Viewer desktop handoff relative to the shared request directory"
+    if not isinstance(value, str):
+        raise RequestFieldTypeError(field, expected)
+    relative = PurePosixPath(value)
+    if (
+        any(character in value for character in ("\\", ":", "\x00"))
+        or relative.is_absolute() or len(relative.parts) != 2
+        or ".." in relative.parts or value != relative.as_posix()
+        or relative.name != "desktop.json"
+    ):
+        raise RequestFieldValueError(field, expected)
+    try:
+        root = Path(requests_dir).resolve(strict=True)
+        path = root.joinpath(*relative.parts)
+        if path.is_symlink() or not path.is_file() or not path.resolve(strict=True).is_relative_to(root):
+            raise RequestFieldValueError(field, expected)
+    except OSError as error:
+        raise RequestFieldValueError(field, expected) from error
+    return str(path)
 
 
 def build_child_environment(
@@ -1655,6 +1679,13 @@ def parse_request_payload(
     if not host_cwd_path.is_dir():
         raise HostWorkingDirectoryError(host_cwd)
 
+    if "HOST_DTS_VIEWER_HANDOFF" in forwarded_env:
+        forwarded_env = {
+            **forwarded_env,
+            "HOST_DTS_VIEWER_HANDOFF": map_viewer_handoff(
+                forwarded_env["HOST_DTS_VIEWER_HANDOFF"], config.requests_dir,
+            ),
+        }
     child_env = build_child_environment(forwarded_env)
     mapped_argv = sanitize_delegated_command_argv(
         command_path,
