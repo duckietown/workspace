@@ -63,7 +63,44 @@ updated Workspace or matching host DTS. Normal transfer waiting periods
 still apply; initialization does not automatically transfer or revoke
 existing permissions.
 
-### Tests
+## Native Viewer host delegation
+
+Duckietown Viewer commands on Ente authorize in the launching DTS before starting the backend
+or delegating a desktop frontend. The native host receives a private
+`DTS_VIEWER_HANDOFF` path through the existing shared host-runner directory,
+not an identity token. The wire path is relative to that directory and resolved
+on the native host, so host/guest absolute paths need not match. Traversal,
+escaping links and non-desktop handoff files are rejected.
+Its native verifier checks the same live DTS session,
+selected app, exact backend URL, component inventory and host computer.
+A forwarded frontend URL or host-runner flag alone is not authorization.
+
+Update the signed command sets used by both active profiles and Viewer-capable
+native DTS on both host and guest; older renderer-only builds cannot consume
+Viewer protocol 1. A verified Ente handoff stays on the guarded path even if the
+native profile otherwise selects Daffy. Keep the
+launching Workspace/DTS process alive. The backend and frontend renew
+ten-second heartbeats and stop protected operation when their bounded proofs
+expire, at most thirty seconds. The shared host identity still consumes only
+one Ente computer registration.
+
+Restart/reinitialize an existing native host-runner process with the updated
+Workspace scripts so it loads the relative-handoff mapping too.
+
+The private handoff directory must be readable on both sides through the
+configured shared path, and the backend/broker address must be reachable from
+the relevant Docker/native networks. Do not manually copy handoffs, forward
+DT2 tokens or use a bare URL to work around routing errors. On expiry or
+delegation failure, relaunch through DTS. Daffy retains its legacy plan-free
+Viewer path.
+
+Source/custom Viewer work requires its separate staff/superuser developer grant;
+see the
+[DTS Viewer guide](https://github.com/duckietown/duckietown-shell/blob/main/devel.md#duckietown-viewer-authorization).
+Real WSL/native Windows, FEX, macOS LaunchServices and host/Docker networking
+validation remains a release gate, not a claim established by unit tests.
+
+## Tests
 
 The host identity tests use Python's standard library. Docker Compose is
 also used to validate the actual mount configuration when available:
