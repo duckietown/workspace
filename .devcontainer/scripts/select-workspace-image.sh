@@ -6,6 +6,7 @@ set -eu
 devcontainer_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 repo_root=$(CDPATH= cd -- "$devcontainer_dir/.." && pwd)
 env_file="$devcontainer_dir/.env"
+host_machine_id_file="$devcontainer_dir/.host-machine-id"
 host_runner_script="$devcontainer_dir/scripts/host_runner.py"
 host_runner_bootstrap_script="$devcontainer_dir/scripts/host_runner_bootstrap.py"
 host_runner_runtime_dir="/tmp/duckietown"
@@ -91,7 +92,7 @@ run_host_python() {
     return
   fi
 
-  printf '%s\n' "Could not find a host Python interpreter required for host GUI delegation." >&2
+  printf '%s\n' "Could not find a host Python interpreter required for Workspace initialization." >&2
   return 1
 }
 
@@ -458,6 +459,9 @@ if running_inside_container; then
   printf '%s\n' "select-workspace-image.sh must run on the host, not inside the dev container." >&2
   exit 1
 fi
+
+run_host_python "$host_runner_bootstrap_script" write-machine-id \
+  --output "$host_machine_id_file"
 
 migrate_repo_local_host_runner_artifacts
 

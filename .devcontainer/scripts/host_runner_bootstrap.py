@@ -3,14 +3,19 @@
 
 import argparse
 import http.client
+import os
+import plistlib
 import secrets
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 HEALTH_PATH = "/healthz"
 HEALTH_RESPONSE = b"host-runner:ok"
@@ -70,6 +75,9 @@ def _parse_args() -> argparse.Namespace:
 
     subcommands.add_parser("generate-token")
 
+    machine_id = subcommands.add_parser("write-machine-id")
+    machine_id.add_argument("--output", required=True, type=Path)
+
     wait_ready = subcommands.add_parser("wait-ready")
     wait_ready.add_argument("--host", required=True)
     wait_ready.add_argument("--port", required=True, type=int)
@@ -95,6 +103,82 @@ def _parse_args() -> argparse.Namespace:
     supervise_command.add_argument("--restart-delay", default=1.0, type=float)
 
     return parser.parse_args()
+
+
+def _read_host_machine_id() -> str:
+    if sys.platform.startswith("linux"):
+        try:
+            value = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            value = (
+                Path("/var/lib/dbus/machine-id")
+                .read_text(
+                    encoding="ascii",
+                )
+                .strip()
+            )
+    elif sys.platform == "darwin":
+        output = subprocess.check_output(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice", "-a"],
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        devices = plistlib.loads(output)
+        if (
+            not isinstance(devices, list)
+            or not devices
+            or not isinstance(devices[0], dict)
+        ):
+            msg = "macOS did not return a computer identity."
+            raise ValueError(msg)
+        value = devices[0].get("IOPlatformUUID")
+    elif sys.platform == "win32":
+        import winreg  # noqa: PLC0415
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+    else:
+        msg = (
+            "Host computer identification is not supported on "
+            f"'{sys.platform}'."
+        )
+        raise ValueError(msg)
+    if not isinstance(value, str):
+        msg = "The host did not return a computer UUID."
+        raise TypeError(msg)
+    identifier = uuid.UUID(value.strip())
+    if identifier.int == 0:
+        msg = "The host has an uninitialized machine identity."
+        raise ValueError(msg)
+    return identifier.hex
+
+
+def _write_host_machine_id(output: Path) -> int:
+    content = (_read_host_machine_id() + "\n").encode("ascii")
+    if output.is_symlink() or (output.exists() and not output.is_file()):
+        msg = "The generated host machine identity must be a regular file."
+        raise ValueError(msg)
+    if output.is_file() and output.read_bytes() == content:
+        output.chmod(0o644)
+        return 0
+    descriptor, filename = tempfile.mkstemp(
+        dir=output.parent,
+        prefix=f"{output.name}.",
+    )
+    temporary_path = Path(filename)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+        temporary_path.chmod(0o644)
+        temporary_path.replace(output)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return 0
 
 
 def _generate_token() -> int:
@@ -327,12 +411,15 @@ class _HostRunnerSupervisor:
         return process.poll()
 
     def child_is_healthy(self) -> bool:
-        return _wait_ready(
-            self.probe_host,
-            self._config.listen_port,
-            SUPERVISOR_CHILD_HEALTHCHECK_TIMEOUT_SECONDS,
-            request_timeout=SUPERVISOR_CHILD_HEALTHCHECK_TIMEOUT_SECONDS,
-        ) == 0
+        return (
+            _wait_ready(
+                self.probe_host,
+                self._config.listen_port,
+                SUPERVISOR_CHILD_HEALTHCHECK_TIMEOUT_SECONDS,
+                request_timeout=SUPERVISOR_CHILD_HEALTHCHECK_TIMEOUT_SECONDS,
+            )
+            == 0
+        )
 
     def wait_for_child_exit(self) -> int:
         startup_deadline = (
@@ -425,6 +512,20 @@ def main() -> int:
     args = _parse_args()
     if args.command == "generate-token":
         return _generate_token()
+    if args.command == "write-machine-id":
+        try:
+            exit_code = _write_host_machine_id(args.output)
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            ExpatError,
+            subprocess.SubprocessError,
+        ) as error:
+            message = f"Could not prepare the host machine identity: {error}"
+            _write_line(message)
+            exit_code = 1
+        return exit_code
     if args.command == "wait-ready":
         return _wait_ready(args.host, args.port, args.timeout)
     if args.command == "scrub-endpoint":

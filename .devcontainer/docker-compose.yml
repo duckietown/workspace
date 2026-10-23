@@ -9,6 +9,19 @@ services:
     # Reap background processes started by the dev container startup script instead of leaving zombies.
     init: true
     volumes:
+      # Keep DTS and native Renderers on the host's registered computer identity.
+      - type: bind
+        source: ./.host-machine-id
+        target: /etc/machine-id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.host-machine-id
+        target: /var/lib/dbus/machine-id
+        read_only: true
+        bind:
+          create_host_path: false
       # Persist the workspace user's home directory across container rebuilds.
       - workspace-home:/home/ubuntu
       # Give /tmp a fresh anonymous volume for each container.
