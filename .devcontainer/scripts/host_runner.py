@@ -134,6 +134,7 @@ INIT_SD_CARD_ALLOWED_STEPS = {
     "verify",
 }
 MATRIX_BOOLEAN_ARG_MAP = {
+    "--cameras-only": "--cameras-only",
     "--force-opengl": "--force-opengl",
     "--force-vulkan": "--force-vulkan",
     "--no-tutorial": "--no-tutorial",
