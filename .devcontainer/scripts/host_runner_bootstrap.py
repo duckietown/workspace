@@ -3,7 +3,9 @@
 
 import argparse
 import http.client
+import os
 import secrets
+import shlex
 import signal
 import socket
 import subprocess
@@ -22,6 +24,7 @@ SUPERVISOR_CHILD_HEALTHCHECK_TIMEOUT_SECONDS = 1
 SUPERVISOR_CHILD_STARTUP_GRACE_SECONDS = 5
 SUPERVISOR_CHILD_UNHEALTHY_GRACE_SECONDS = 2
 LOOPBACK_LISTEN_HOST = "127.0.0.1"
+RUNNER_STOP_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,132 @@ class _SupervisorConfig:
         return command
 
 
+def _host_runner_command_arguments(arguments: list[str]) -> list[str] | None:
+    if not arguments or "-c" in arguments or "-m" in arguments:
+        return None
+    executable_path = Path(arguments[0])
+    executable_name = executable_path.name
+    executable = executable_name.lower()
+    if not executable.startswith(("python", "pypy", "py.exe")):
+        return None
+    script_index = 1
+    while (
+        script_index < len(arguments)
+        and arguments[script_index].startswith("-")
+    ):
+        script_index += 1
+    if script_index == len(arguments):
+        return None
+    script_path = Path(arguments[script_index])
+    script = script_path.name
+    command_arguments = arguments[script_index + 1:]
+    runner = script in {
+        "host_runner.py",
+        "duckietown_host_runner.py",
+    }
+    supervisor = script in {
+        "host_runner_bootstrap.py",
+        "duckietown_host_runner_bootstrap.py",
+    } and command_arguments[:1] == ["supervise"]
+    if runner or supervisor:
+        return command_arguments
+    return None
+
+
+def _host_runner_processes(requests_dir: str) -> dict[int, int]:
+    process_command = [
+        "ps",
+        "-ww",
+        "-axo",
+        "pid=,ppid=,command=",
+    ]
+    if hasattr(os, "getuid"):
+        user_id = os.getuid()
+        user_id_text = str(user_id)
+        process_command = [
+            "ps",
+            "-ww",
+            "-u",
+            user_id_text,
+            "-o",
+            "pid=,ppid=,command=",
+        ]
+    result = subprocess.run(  # noqa: S603
+        process_command,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    queue_path = Path(requests_dir)
+    queue_path = queue_path.expanduser()
+    queue_path = queue_path.resolve()
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        allow_abbrev=False,
+        exit_on_error=False,
+    )
+    parser.add_argument("--requests-dir")
+    processes = {}
+    for line in result.stdout.splitlines():
+        try:
+            process_text, parent_text, command_line = line.split(maxsplit=2)
+            process_id = int(process_text)
+            parent_id = int(parent_text)
+            arguments = shlex.split(command_line)
+        except ValueError:
+            continue
+        command_arguments = _host_runner_command_arguments(arguments)
+        if command_arguments is None:
+            continue
+        try:
+            options, _ = parser.parse_known_args(command_arguments)
+        except argparse.ArgumentError:
+            continue
+        if options.requests_dir is None:
+            continue
+        candidate = Path(options.requests_dir)
+        candidate = candidate.expanduser()
+        candidate = candidate.resolve()
+        if candidate == queue_path:
+            processes[process_id] = parent_id
+    return processes
+
+
+def _stop_runners(
+    requests_dir: str,
+    *,
+    keep_pid: int | None = None,
+) -> int:
+    processes = _host_runner_processes(requests_dir)
+    preserved = set()
+    while (
+        keep_pid is not None
+        and keep_pid in processes
+        and keep_pid not in preserved
+    ):
+        preserved.add(keep_pid)
+        keep_pid = processes[keep_pid]
+    remaining = set(processes) - preserved
+    for process_id in sorted(remaining):
+        try:
+            os.kill(process_id, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    deadline = time.monotonic() + RUNNER_STOP_TIMEOUT_SECONDS
+    while remaining:
+        current = _host_runner_processes(requests_dir)
+        remaining.intersection_update(current)
+        if not remaining or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    for process_id in sorted(remaining):
+        try:
+            os.kill(process_id, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+    return 0
+
+
 class _UnsupportedCommandError(SystemExit):
 
     def __init__(self, command: str) -> None:
@@ -83,6 +212,10 @@ def _parse_args() -> argparse.Namespace:
 
     select_port_command = subcommands.add_parser("select-port")
     select_port_command.add_argument("--preferred", required=True, type=int)
+
+    stop_runners = subcommands.add_parser("stop-runners")
+    stop_runners.add_argument("--requests-dir", required=True)
+    stop_runners.add_argument("--keep-pid", type=int, default=None)
 
     supervise_command = subcommands.add_parser("supervise")
     supervise_command.add_argument("--script", required=True)
@@ -436,6 +569,8 @@ def main() -> int:
         )
     if args.command == "select-port":
         return _select_port(args.preferred)
+    if args.command == "stop-runners":
+        return _stop_runners(args.requests_dir, keep_pid=args.keep_pid)
     if args.command == "supervise":
         config = _SupervisorConfig(
             script=args.script,
