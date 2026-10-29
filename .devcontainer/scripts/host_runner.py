@@ -139,6 +139,7 @@ MATRIX_BOOLEAN_ARG_MAP = {
     "--no-tutorial": "--no-tutorial",
     "--on-top": "--on-top",
     "--profiler": "--profiler",
+    "--live-profiler": "--live-profiler",
     "--verbose": "--verbose",
     "-gl": "--force-opengl",
     "-vk": "--force-vulkan",
@@ -147,8 +148,10 @@ MATRIX_BOOLEAN_ARG_MAP = {
 MATRIX_IGNORED_FLAGS = {
     "--embedded",
     "--expose-ports",
+    "--gym",
     "--no-pull",
     "--sandbox",
+    "--simulation",
     "--standalone",
     "--static-ports",
     "-S",
@@ -1495,6 +1498,25 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
                     OS_FAMILY_VALUES,
                 )
             sanitized.extend(["--os-family", value])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            short_option="-dt" if arg == "-dt" else "-t",
+            long_option="--delta-t",
+        )
+        if consumed:
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--shm-path",
+        )
+        if consumed:
             index += consumed
             continue
 
