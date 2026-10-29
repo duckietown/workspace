@@ -136,9 +136,11 @@ INIT_SD_CARD_ALLOWED_STEPS = {
 MATRIX_BOOLEAN_ARG_MAP = {
     "--force-opengl": "--force-opengl",
     "--force-vulkan": "--force-vulkan",
+    "--gym-async-tof": "--gym-async-tof",
     "--no-tutorial": "--no-tutorial",
     "--on-top": "--on-top",
     "--profiler": "--profiler",
+    "--live-profiler": "--live-profiler",
     "--verbose": "--verbose",
     "-gl": "--force-opengl",
     "-vk": "--force-vulkan",
