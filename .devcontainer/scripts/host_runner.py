@@ -1505,6 +1505,15 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
         value, consumed = read_option_value(
             argv,
             index,
+            long_option="--environments",
+        )
+        if consumed:
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
             short_option="-dt" if arg == "-dt" else "-t",
             long_option="--delta-t",
         )
