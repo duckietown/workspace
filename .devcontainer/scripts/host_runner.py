@@ -134,7 +134,7 @@ INIT_SD_CARD_ALLOWED_STEPS = {
     "verify",
 }
 MATRIX_BOOLEAN_ARG_MAP = {
-    "--cameras-only": "--cameras-only",
+    "--no-spectator-cameras": "--no-spectator-cameras",
     "--force-opengl": "--force-opengl",
     "--force-vulkan": "--force-vulkan",
     "--no-tutorial": "--no-tutorial",
@@ -1499,6 +1499,15 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
                     OS_FAMILY_VALUES,
                 )
             sanitized.extend(["--os-family", value])
+            index += consumed
+            continue
+
+        value, consumed = read_option_value(
+            argv,
+            index,
+            long_option="--environments",
+        )
+        if consumed:
             index += consumed
             continue
 
