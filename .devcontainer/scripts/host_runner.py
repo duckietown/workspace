@@ -1710,11 +1710,20 @@ class FileStreamWriter:
             f"{STREAM_CHUNK_FILE_SUFFIX}"
         )
         chunk_path = self._stream_path.with_name(chunk_name)
-        with open_chunk_file_for_write(chunk_path) as stream:
-            stream.write(self._pending)
-            stream.flush()
-            file_descriptor = stream.fileno()
-            os.fsync(file_descriptor)
+        temporary_id = uuid.uuid4()
+        temporary_path = chunk_path.with_name(
+            f"{chunk_name}.{temporary_id.hex}.tmp",
+        )
+        try:
+            with open_chunk_file_for_write(temporary_path) as stream:
+                stream.write(self._pending)
+                stream.flush()
+                file_descriptor = stream.fileno()
+                os.fsync(file_descriptor)
+            ensure_request_artifact_is_not_symlink(chunk_path)
+            temporary_path.replace(chunk_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
         self._chunk_index += 1
         self._pending.clear()
         directory_fd: int | None = None
