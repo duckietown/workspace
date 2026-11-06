@@ -372,22 +372,11 @@ read_recorded_host_runner_version() {
 }
 
 stop_managed_host_runner() {
-  managed_pid=""
-
-  if [ -f "$host_runner_pid_file" ]; then
-    existing_pid=$(tr -d '[:space:]' < "$host_runner_pid_file")
-    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      managed_pid=$existing_pid
-    fi
-  fi
-
-  if [ -z "$managed_pid" ]; then
-    managed_pid=$(find_managed_host_runner_listener_pid || true)
-  fi
-
-  if [ -n "$managed_pid" ]; then
-    kill "$managed_pid" 2>/dev/null || true
-    wait_for_process_exit "$managed_pid" || true
+  if ! run_host_python \
+    "$host_runner_bootstrap_script" \
+    stop-runners \
+    --requests-dir "$host_runner_request_dir"; then
+    return 1
   fi
 
   rm -f "$host_runner_pid_file"
@@ -412,6 +401,13 @@ start_host_runner() {
       printf '%s\n' "$current_listener_pid" > "$host_runner_pid_file"
     fi
     if [ -n "$current_listener_pid" ] && [ "$current_host_runner_version" = "$recorded_host_runner_version" ]; then
+      if ! run_host_python \
+        "$host_runner_bootstrap_script" \
+        stop-runners \
+        --requests-dir "$host_runner_request_dir" \
+        --keep-pid "$current_listener_pid"; then
+        return 1
+      fi
       record_host_runner_endpoint "$token" "$preserved_host_runner_timeout"
       return 0
     fi
