@@ -41,6 +41,9 @@ DEFAULT_REQUESTS_DIR_PATH = Path("/tmp/duckietown/host_runner_requests")  # noqa
 REQUESTS_DIR_ROOT_PATH = DEFAULT_REQUESTS_DIR_PATH.parent
 
 HOST_RUNNER_ACTIVE_ENV = "DTS_HOST_RUNNER_ACTIVE"
+HOST_RUNNER_TRACE_OUTPUT_ENV = "DTS_HOST_RUNNER_TRACE_OUTPUT"
+TRACE_FINALIZE_TIMEOUT_SECONDS = 120
+TRACE_EXPORT_TIMEOUT_SECONDS = 120
 HOST_RUNNER_EXIT_CODE_PREFIX = "===DTS_HOST_RUNNER_EXIT_CODE==="
 HOST_RUNNER_HEALTH_RESPONSE = b"host-runner:ok"
 REQUEST_FILE_SUFFIX = ".request.json"
@@ -133,8 +136,19 @@ INIT_SD_CARD_ALLOWED_STEPS = {
     "setup",
     "verify",
 }
+MATRIX_TRACE_OPTION_LIMITS = {
+    "--trace-duration": (-1, 300),
+    "--trace-window": (-1, 60),
+    "--trace-start-session": (1, 1_000_000),
+}
+MATRIX_TRACE_PERFORMANCE_STATES = ("default", "minimum", "medium", "maximum")
 MATRIX_BOOLEAN_ARG_MAP = {
     "--cameras-only": "--cameras-only",
+    "--trace": "--trace",
+    "--trace-export": "--trace-export",
+    "--trace-waiting-threads": "--trace-waiting-threads",
+    "--trace-kernel-callstacks": "--trace-kernel-callstacks",
+    "--trace-context-switch-sampling": "--trace-context-switch-sampling",
     "--force-opengl": "--force-opengl",
     "--force-vulkan": "--force-vulkan",
     "--no-tutorial": "--no-tutorial",
@@ -1011,7 +1025,11 @@ def require_option_value(value: str | None, *, option_name: str) -> str:
     return value
 
 
-def validate_renderer_binary_relative_parts(value: str) -> tuple[str, ...]:
+def validate_renderer_binary_relative_parts(
+    value: str,
+    *,
+    option_name: str = "--renderer-binary",
+) -> tuple[str, ...]:
     value_posix_path = PurePosixPath(value)
     sanitized_parts: list[str] = []
 
@@ -1020,15 +1038,14 @@ def validate_renderer_binary_relative_parts(value: str) -> tuple[str, ...]:
             continue
         if part == "..":
             message = (
-                "--renderer-binary must stay within the delegated "
-                "workspace."
+                f"{option_name} must stay within the delegated workspace."
             )
             raise delegated_argument_error(message)
         sanitized_parts.append(part)
 
     if not sanitized_parts:
         message = (
-            "--renderer-binary must stay within the delegated workspace."
+            f"{option_name} must stay within the delegated workspace."
         )
         raise delegated_argument_error(message)
 
@@ -1041,9 +1058,12 @@ def map_renderer_binary_path(
     host_cwd: str,
     container_root: str,
     host_root: str,
+    option_name: str = "--renderer-binary",
 ) -> str:
     if value.startswith("~"):
-        message = "--renderer-binary must stay within the delegated workspace."
+        message = (
+            f"{option_name} must stay within the delegated workspace."
+        )
         raise delegated_argument_error(message)
 
     value_posix_path = PurePosixPath(value)
@@ -1053,7 +1073,10 @@ def map_renderer_binary_path(
     host_cwd_path = Path(host_cwd)
     host_root_path = Path(host_root)
     resolved_host_root_path = host_root_path.resolve(strict=True)
-    relative_parts = validate_renderer_binary_relative_parts(value)
+    relative_parts = validate_renderer_binary_relative_parts(
+        value,
+        option_name=option_name,
+    )
     candidate_path = host_cwd_path.joinpath(*relative_parts)
     try:
         resolved_candidate_path = candidate_path.resolve(strict=True)
@@ -1319,6 +1342,75 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
     index = 0
     while index < len(argv):
         arg = argv[index]
+
+        trace_option = arg.split("=", 1)[0]
+        if trace_option == "--trace-performance-state":
+            value, consumed = read_option_value(
+                argv, index, long_option=trace_option,
+            )
+            value = require_option_value(value, option_name=trace_option)
+            if value not in MATRIX_TRACE_PERFORMANCE_STATES:
+                raise option_must_be_one_of_error(
+                    trace_option, MATRIX_TRACE_PERFORMANCE_STATES,
+                )
+            if trace_option in sanitized:
+                message = f"{trace_option} must be specified only once."
+                raise delegated_argument_error(message)
+            sanitized.extend([trace_option, value])
+            index += consumed
+            continue
+
+        if trace_option == "--trace-template":
+            value, consumed = read_option_value(
+                argv, index, long_option=trace_option,
+            )
+            value = require_option_value(value, option_name=trace_option)
+            if trace_option in sanitized:
+                message = f"{trace_option} must be specified only once."
+                raise delegated_argument_error(message)
+            template = map_renderer_binary_path(
+                value,
+                host_cwd=host_cwd,
+                container_root=container_root,
+                host_root=host_root,
+                option_name=trace_option,
+            )
+            template_path = Path(template)
+            if (
+                template_path.suffix != ".tracetemplate"
+                or not template_path.is_file()
+            ):
+                message = (
+                    "--trace-template requires an existing "
+                    ".tracetemplate file."
+                )
+                raise delegated_argument_error(message)
+            sanitized.extend([trace_option, template])
+            index += consumed
+            continue
+
+        if trace_option in MATRIX_TRACE_OPTION_LIMITS:
+            value, consumed = read_option_value(
+                argv, index, long_option=trace_option,
+            )
+            value = require_option_value(value, option_name=trace_option)
+            minimum, maximum = MATRIX_TRACE_OPTION_LIMITS[trace_option]
+            limit = validate_integer_option(
+                value, option_name=trace_option, minimum=minimum,
+                maximum=maximum,
+            )
+            if trace_option in sanitized:
+                message = f"{trace_option} must be specified only once."
+                raise delegated_argument_error(message)
+            if limit == "0":
+                message = (
+                    f"{trace_option} requires -1 or a positive "
+                    "bounded integer, once."
+                )
+                raise delegated_argument_error(message)
+            sanitized.extend([trace_option, limit])
+            index += consumed
+            continue
 
         value, consumed = read_option_value(
             argv,
@@ -1610,6 +1702,29 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
         detail = f"unexpected positional argument {arg!r}"
         raise invalid_delegated_arguments_error(command, detail)
 
+    trace_controls = {
+        "--trace-duration", "--trace-window", "--trace-export",
+        "--trace-start-session", "--trace-template",
+        "--trace-performance-state", "--trace-waiting-threads",
+        "--trace-kernel-callstacks", "--trace-context-switch-sampling",
+    }
+    if trace_controls.intersection(sanitized) and "--trace" not in sanitized:
+        message = "Trace control options require --trace."
+        raise delegated_argument_error(message)
+    if (
+        "--trace-start-session" in sanitized
+        and "--live-profiler" not in sanitized
+    ):
+        message = "--trace-start-session requires --live-profiler."
+        raise delegated_argument_error(message)
+    if "--trace-performance-state" in sanitized:
+        state = sanitized[sanitized.index("--trace-performance-state") + 1]
+        if state != "default" and "--trace-template" not in sanitized:
+            message = (
+                "A non-default --trace-performance-state requires "
+                "--trace-template saved with that state in Instruments."
+            )
+            raise delegated_argument_error(message)
     return sanitized
 
 
@@ -1649,9 +1764,40 @@ def sanitize_delegated_command_argv(
     return sanitize_viewer_argv(command, argv)
 
 
+def prepare_trace_output(
+    argv: list[str],
+    config: argparse.Namespace,
+    request_id: str | None,
+) -> str:
+    if request_id is None or config.requests_dir is None:
+        message = "--trace requires the shared request queue for retrieval."
+        raise delegated_argument_error(message)
+    if sys.platform != "darwin":
+        message = "--trace requires a macOS host with Xcode Instruments."
+        raise delegated_argument_error(message)
+    duration = (
+        int(argv[argv.index("--trace-duration") + 1])
+        if "--trace-duration" in argv else 30
+    )
+    window = (
+        int(argv[argv.index("--trace-window") + 1])
+        if "--trace-window" in argv else min(10, duration)
+    )
+    if duration > 0 and window > duration:
+        message = "--trace-window cannot exceed --trace-duration."
+        raise delegated_argument_error(message)
+    artifact_directory = request_path_for_suffix(
+        Path(config.requests_dir), request_id, ".trace-artifacts",
+    )
+    artifact_directory.mkdir(mode=0o700)
+    return str(artifact_directory / "renderer.trace")
+
+
 def parse_request_payload(
     payload: object,
     config: argparse.Namespace,
+    *,
+    request_id: str | None = None,
 ) -> tuple[list[str], str, dict[str, str], bool]:
     if not isinstance(payload, dict):
         raise RequestFieldTypeError(REQUEST_ENV_FIELD, REQUEST_ENV_EXPECTATION)
@@ -1695,6 +1841,13 @@ def parse_request_payload(
         container_root=config.container_root,
         host_root=config.host_root,
     )
+    if (
+        delegated_command_key(command_path) == ("matrix", "run")
+        and "--trace" in mapped_argv
+    ):
+        child_env[HOST_RUNNER_TRACE_OUTPUT_ENV] = prepare_trace_output(
+            mapped_argv, config, request_id,
+        )
     command_list = [config.dts_executable, *command_path, *mapped_argv]
     emit_launch_context = "--verbose" in mapped_argv or "-vv" in mapped_argv
     return command_list, host_cwd, child_env, emit_launch_context
@@ -1842,6 +1995,8 @@ def signal_process_group(
 def request_process_shutdown(  # noqa: C901
     process: ManagedProcess,
     input_stream: IO[str] | None = None,
+    *,
+    interrupt_grace: float = PROCESS_WAIT_TIMEOUT_SECONDS,
 ) -> None:
     if process.poll() is not None:
         return
@@ -1861,7 +2016,7 @@ def request_process_shutdown(  # noqa: C901
         with suppress(OSError, ValueError):
             process.send_signal(signal.SIGINT)
 
-    deadline = time.monotonic() + PROCESS_WAIT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + interrupt_grace
     while time.monotonic() < deadline:
         if process.poll() is not None:
             return
@@ -1890,10 +2045,18 @@ def watch_for_cancellation(
     cancel_path: Path,
     heartbeat_path: Path,
     input_stream: IO[str] | None,
+    *,
+    trace_finish_timeout: int | None = None,
 ) -> None:
+    interrupt_grace = PROCESS_WAIT_TIMEOUT_SECONDS
+    if trace_finish_timeout is not None:
+        interrupt_grace = trace_finish_timeout + 5
+        input_stream = None
     while process.poll() is None:
         if cancel_request_is_signaled(cancel_path):
-            request_process_shutdown(process, input_stream)
+            request_process_shutdown(
+                process, input_stream, interrupt_grace=interrupt_grace,
+            )
             return
         if request_heartbeat_is_stale(heartbeat_path):
             stale_message = (
@@ -1901,7 +2064,9 @@ def watch_for_cancellation(
                 f"{heartbeat_path.name}; stopping child."
             )
             write_line(sys.stderr, stale_message)
-            request_process_shutdown(process, input_stream)
+            request_process_shutdown(
+                process, input_stream, interrupt_grace=interrupt_grace,
+            )
             return
         time.sleep(REQUEST_CONTROL_POLL_INTERVAL_SECONDS)
 
@@ -1941,7 +2106,7 @@ def process_request_file(
             host_cwd,
             child_env,
             emit_launch_context,
-        ) = parse_request_payload(payload, config)
+        ) = parse_request_payload(payload, config, request_id=request_id)
         stream_process_output(
             command,
             host_cwd,
@@ -2106,9 +2271,15 @@ def stream_process_output(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
     cancellation_thread: threading.Thread | None = None
     if cancel_path is not None:
+        trace_finish_timeout: int | None = None
+        if HOST_RUNNER_TRACE_OUTPUT_ENV in env:
+            trace_finish_timeout = TRACE_FINALIZE_TIMEOUT_SECONDS
+            if "--trace-export" in command_list:
+                trace_finish_timeout += 2 * TRACE_EXPORT_TIMEOUT_SECONDS
         cancellation_thread = threading.Thread(
             target=watch_for_cancellation,
             args=(process, cancel_path, heartbeat_path, stdin_stream),
+            kwargs={"trace_finish_timeout": trace_finish_timeout},
             daemon=True,
             name=f"host-runner-cancel-{process.pid}",
         )
