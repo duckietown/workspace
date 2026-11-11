@@ -1343,6 +1343,23 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
     while index < len(argv):
         arg = argv[index]
 
+        if arg.split("=", 1)[0] == "--profiler-level":
+            value, consumed = read_option_value(
+                argv,
+                index,
+                long_option="--profiler-level",
+            )
+            value = require_option_value(value, option_name="--profiler-level")
+            if value not in {"counters", "timeline"}:
+                message = "--profiler-level requires counters or timeline."
+                raise delegated_argument_error(message)
+            if "--profiler-level" in sanitized:
+                message = "--profiler-level must be specified only once."
+                raise delegated_argument_error(message)
+            sanitized.extend(["--profiler-level", value])
+            index += consumed
+            continue
+
         trace_option = arg.split("=", 1)[0]
         if trace_option == "--trace-performance-state":
             value, consumed = read_option_value(
@@ -1702,6 +1719,13 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
         detail = f"unexpected positional argument {arg!r}"
         raise invalid_delegated_arguments_error(command, detail)
 
+    if (
+        "--profiler-level" in sanitized
+        and "--profiler" not in sanitized
+        and "--live-profiler" not in sanitized
+    ):
+        message = "--profiler-level requires --profiler or --live-profiler."
+        raise delegated_argument_error(message)
     trace_controls = {
         "--trace-duration", "--trace-window", "--trace-export",
         "--trace-start-session", "--trace-template",
