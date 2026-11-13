@@ -155,6 +155,8 @@ MATRIX_BOOLEAN_ARG_MAP = {
     "--on-top": "--on-top",
     "--profiler": "--profiler",
     "--live-profiler": "--live-profiler",
+    "--profiler-memory": "--profiler-memory",
+    "--profiler-no-table": "--profiler-no-table",
     "--verbose": "--verbose",
     "-gl": "--force-opengl",
     "-vk": "--force-vulkan",
@@ -1360,6 +1362,28 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
             index += consumed
             continue
 
+        if arg.split("=", 1)[0] == "--profiler-report-interval":
+            value, consumed = read_option_value(
+                argv,
+                index,
+                long_option="--profiler-report-interval",
+            )
+            value = require_option_value(
+                value, option_name="--profiler-report-interval",
+            )
+            interval = validate_integer_option(
+                value, option_name="--profiler-report-interval",
+                minimum=1, maximum=2_147_483_647,
+            )
+            if "--profiler-report-interval" in sanitized:
+                message = (
+                    "--profiler-report-interval must be specified only once."
+                )
+                raise delegated_argument_error(message)
+            sanitized.extend(["--profiler-report-interval", interval])
+            index += consumed
+            continue
+
         trace_option = arg.split("=", 1)[0]
         if trace_option == "--trace-performance-state":
             value, consumed = read_option_value(
@@ -1725,6 +1749,18 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
         and "--live-profiler" not in sanitized
     ):
         message = "--profiler-level requires --profiler or --live-profiler."
+        raise delegated_argument_error(message)
+    reporting_controls = {
+        "--profiler-memory", "--profiler-no-table",
+        "--profiler-report-interval",
+    }
+    if (
+        reporting_controls.intersection(sanitized)
+        and "--live-profiler" not in sanitized
+    ):
+        message = (
+            "Profiler memory and reporting options require --live-profiler."
+        )
         raise delegated_argument_error(message)
     trace_controls = {
         "--trace-duration", "--trace-window", "--trace-export",
