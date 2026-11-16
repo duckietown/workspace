@@ -144,6 +144,7 @@ MATRIX_TRACE_OPTION_LIMITS = {
 MATRIX_TRACE_PERFORMANCE_STATES = ("default", "minimum", "medium", "maximum")
 MATRIX_BOOLEAN_ARG_MAP = {
     "--no-spectator-cameras": "--no-spectator-cameras",
+    "--metal-capture": "--metal-capture",
     "--trace": "--trace",
     "--trace-export": "--trace-export",
     "--trace-waiting-threads": "--trace-waiting-threads",
