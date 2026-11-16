@@ -42,6 +42,7 @@ REQUESTS_DIR_ROOT_PATH = DEFAULT_REQUESTS_DIR_PATH.parent
 
 HOST_RUNNER_ACTIVE_ENV = "DTS_HOST_RUNNER_ACTIVE"
 HOST_RUNNER_TRACE_OUTPUT_ENV = "DTS_HOST_RUNNER_TRACE_OUTPUT"
+HOST_RUNNER_CAPTURE_OUTPUT_ENV = "DTS_HOST_RUNNER_CAPTURE_OUTPUT"
 TRACE_FINALIZE_TIMEOUT_SECONDS = 120
 TRACE_EXPORT_TIMEOUT_SECONDS = 120
 HOST_RUNNER_EXIT_CODE_PREFIX = "===DTS_HOST_RUNNER_EXIT_CODE==="
@@ -76,6 +77,7 @@ REQUEST_ENV_EXPECTATION = "a JSON object"
 HOST_RUNNER_DTS_EXECUTABLE = "dts"
 ALLOWED_DELEGATED_DTS_COMMANDS = (
     ("matrix", "run"),
+    ("matrix", "capture"),
     ("init_sd_card",),
     ("sd_card", "init"),
     ("sd_card", "update"),
@@ -142,6 +144,12 @@ MATRIX_TRACE_OPTION_LIMITS = {
     "--trace-start-session": (1, 1_000_000),
 }
 MATRIX_TRACE_PERFORMANCE_STATES = ("default", "minimum", "medium", "maximum")
+MATRIX_CAPTURE_MAX_NODES = 32
+MATRIX_CAPTURE_EXECUTIONS = ("overlapping", "serial")
+MATRIX_CAPTURE_NODE_PATTERN = re.compile(
+    r"^/(?:commands|resources|performance|api_calls)"
+    r"(?:/[A-Za-z0-9_.\[\]-]+)*$",
+)
 MATRIX_BOOLEAN_ARG_MAP = {
     "--no-spectator-cameras": "--no-spectator-cameras",
     "--metal-capture": "--metal-capture",
@@ -1798,6 +1806,8 @@ def sanitize_delegated_command_argv(
     host_root: str,
 ) -> list[str]:
     command_key = delegated_command_key(command)
+    if command_key == ("matrix", "capture"):
+        return sanitize_matrix_capture_argv(command, argv)
     if command_key == ("matrix", "run"):
         return sanitize_matrix_run_argv(
             command,
@@ -1823,6 +1833,136 @@ def sanitize_delegated_command_argv(
             command_name="sd_card update",
         )
     return sanitize_viewer_argv(command, argv)
+
+
+def sanitize_matrix_capture_argv(  # noqa: C901, PLR0912, PLR0915
+    command: tuple[str, ...], argv: list[str],
+) -> list[str]:
+    sanitized: list[str] = []
+    seen: set[str] = set()
+    booleans = {"--check", "--profile", "--verbose"}
+    integer_options = {"--pid": 1, "--device": 0, "--boundary": 1}
+    value_options = {
+        *integer_options, "--version", "--input", "--profile-execution",
+        "--browse", "--inspect", "--fetch",
+    }
+    index = 0
+    node_count = 0
+    while index < len(argv):
+        option = argv[index].split("=", 1)[0]
+        if (
+            option in seen
+            and option not in {"--browse", "--inspect", "--fetch"}
+        ):
+            message = f"{option} must be specified only once."
+            raise delegated_argument_error(message)
+        if option in booleans and argv[index] == option:
+            sanitized.append(option)
+            index += 1
+        elif option in value_options:
+            value, consumed = read_option_value(
+                argv, index, long_option=option,
+            )
+            value = require_option_value(value, option_name=option)
+            if option in integer_options:
+                value = validate_integer_option(
+                    value, option_name=option,
+                    minimum=integer_options[option], maximum=2_147_483_647,
+                )
+            elif option == "--version":
+                validate_pattern_value(
+                    value, VERSION_PATTERN, option_name=option,
+                    description="a simple installed version identifier",
+                )
+            elif option == "--input":
+                if value != "input.gputrace":
+                    message = (
+                        "--input must use the request-owned staged trace."
+                    )
+                    raise delegated_argument_error(message)
+            elif option == "--profile-execution":
+                if value not in MATRIX_CAPTURE_EXECUTIONS:
+                    raise option_must_be_one_of_error(
+                        option, MATRIX_CAPTURE_EXECUTIONS,
+                    )
+            else:
+                node_count += 1
+                if (
+                    not MATRIX_CAPTURE_NODE_PATTERN.fullmatch(value)
+                    or any(part in (".", "..") for part in value.split("/"))
+                    or node_count > MATRIX_CAPTURE_MAX_NODES
+                ):
+                    message = "Invalid or excessive gpudebug inspection paths."
+                    raise delegated_argument_error(message)
+            sanitized.extend([option, value])
+            index += consumed
+        else:
+            detail = f"unsupported capture option {argv[index]!r}"
+            raise invalid_delegated_arguments_error(command, detail)
+        seen.add(option)
+    if "--profile" in seen and "--input" not in seen:
+        message = "--profile requires a staged --input trace."
+        raise delegated_argument_error(message)
+    if "--profile-execution" in seen and "--profile" not in seen:
+        message = "--profile-execution requires --profile."
+        raise delegated_argument_error(message)
+    if "--input" in seen and seen.intersection(
+        {"--pid", "--boundary", "--version"},
+    ):
+        message = (
+            "--input cannot be combined with live Renderer target options."
+        )
+        raise delegated_argument_error(message)
+    if (
+        "--input" in seen and "--device" in sanitized
+        and sanitized[sanitized.index("--device") + 1] != "0"
+    ):
+        message = "--device is only valid for a live capture."
+        raise delegated_argument_error(message)
+    if "--check" in seen and seen.intersection(
+        {
+            "--input", "--profile", "--browse", "--inspect", "--fetch",
+            "--pid", "--boundary", "--version",
+        },
+    ):
+        message = (
+            "--check cannot be combined with trace analysis "
+            "or live target options."
+        )
+        raise delegated_argument_error(message)
+    return sanitized
+
+
+def prepare_capture_output(
+    argv: list[str], config: argparse.Namespace, request_id: str | None,
+) -> str:
+    if request_id is None or config.requests_dir is None:
+        message = "Metal capture requires the shared request queue."
+        raise delegated_argument_error(message)
+    if sys.platform != "darwin":
+        message = "Metal capture requires a macOS host."
+        raise delegated_argument_error(message)
+    directory = request_path_for_suffix(
+        Path(config.requests_dir), request_id, ".capture-artifacts",
+    )
+    if directory.is_symlink():
+        message = "Capture artifacts cannot be symbolic links."
+        raise delegated_argument_error(message)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if "--input" in argv:
+        source = directory / "input.gputrace"
+        if source.is_symlink() or not source.is_dir():
+            message = "The request-owned staged GPU trace is missing."
+            raise delegated_argument_error(message)
+        argv[argv.index("--input") + 1] = str(source)
+    output = directory / "result"
+    if (
+        output.exists() or output.is_symlink()
+        or (directory / "complete").exists()
+    ):
+        message = "Refusing to overwrite Metal capture artifacts."
+        raise delegated_argument_error(message)
+    return str(output)
 
 
 def prepare_trace_output(
@@ -1902,6 +2042,10 @@ def parse_request_payload(
         container_root=config.container_root,
         host_root=config.host_root,
     )
+    if delegated_command_key(command_path) == ("matrix", "capture"):
+        child_env[HOST_RUNNER_CAPTURE_OUTPUT_ENV] = prepare_capture_output(
+            mapped_argv, config, request_id,
+        )
     if (
         delegated_command_key(command_path) == ("matrix", "run")
         and "--trace" in mapped_argv
