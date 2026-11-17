@@ -153,6 +153,8 @@ MATRIX_CAPTURE_NODE_PATTERN = re.compile(
 )
 MATRIX_BOOLEAN_ARG_MAP = {
     "--no-spectator-cameras": "--no-spectator-cameras",
+    "--camera-cache": "--camera-cache",
+    "--shared-camera-cache": "--shared-camera-cache",
     "--metal-capture": "--metal-capture",
     "--trace": "--trace",
     "--trace-export": "--trace-export",
@@ -1754,6 +1756,9 @@ def sanitize_matrix_run_argv(  # noqa: C901, PLR0912, PLR0915
         detail = f"unexpected positional argument {arg!r}"
         raise invalid_delegated_arguments_error(command, detail)
 
+    if "--camera-cache" in sanitized and "--shared-camera-cache" in sanitized:
+        message = "You cannot use --camera-cache and --shared-camera-cache together."
+        raise delegated_argument_error(message)
     if (
         "--profiler-level" in sanitized
         and "--profiler" not in sanitized
